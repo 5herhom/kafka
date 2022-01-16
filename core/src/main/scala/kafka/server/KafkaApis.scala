@@ -1122,17 +1122,20 @@ class KafkaApis(val requestChannel: RequestChannel,
       if (!authorize(request.session, Describe, new Resource(Group, groupId))) {
         groupId -> DescribeGroupsResponse.GroupMetadata.forError(Errors.GROUP_AUTHORIZATION_FAILED)
       } else {
+        //核心部分：通过groupid获取消费信息
         val (error, summary) = groupCoordinator.handleDescribeGroup(groupId)
+        //序列化消费组成员信息成二进制
         val members = summary.members.map { member =>
           val metadata = ByteBuffer.wrap(member.metadata)
           val assignment = ByteBuffer.wrap(member.assignment)
           new DescribeGroupsResponse.GroupMember(member.memberId, member.clientId, member.clientHost, metadata, assignment)
         }
+        //将消费组信息封装Response消息
         groupId -> new DescribeGroupsResponse.GroupMetadata(error, summary.state, summary.protocolType,
           summary.protocol, members.asJava)
       }
     }.toMap
-
+    //反馈Response给请求者
     sendResponseMaybeThrottle(request, requestThrottleMs => new DescribeGroupsResponse(requestThrottleMs, groups.asJava))
   }
 
