@@ -257,13 +257,14 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     // reject the request if not authorized to the group
     if (!authorize(request.session, Read, new Resource(Group, offsetCommitRequest.groupId))) {
+      //权限不通过
       val error = Errors.GROUP_AUTHORIZATION_FAILED
       val results = offsetCommitRequest.offsetData.keySet.asScala.map { topicPartition =>
         (topicPartition, error)
       }.toMap
       sendResponseMaybeThrottle(request, requestThrottleMs => new OffsetCommitResponse(requestThrottleMs, results.asJava))
     } else {
-
+        //收集没有权限的topic，基本不影响非权限验证的kafka。只需要关注保存了请求的topic信息的authorizedTopicRequestInfo对象即可
       val unauthorizedTopicErrors = mutable.Map[TopicPartition, Errors]()
       val nonExistingTopicErrors = mutable.Map[TopicPartition, Errors]()
       val authorizedTopicRequestInfoBldr = immutable.Map.newBuilder[TopicPartition, OffsetCommitRequest.PartitionData]
@@ -280,6 +281,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       val authorizedTopicRequestInfo = authorizedTopicRequestInfoBldr.result()
 
       // the callback for sending an offset commit response
+      //提交结果的回调Response函数
       def sendResponseCallback(commitStatus: immutable.Map[TopicPartition, Errors]) {
         val combinedCommitStatus = commitStatus ++ unauthorizedTopicErrors ++ nonExistingTopicErrors
         if (isDebugEnabled)
@@ -297,6 +299,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         sendResponseCallback(Map.empty)
       else if (header.apiVersion == 0) {
         // for version 0 always store offsets to ZK
+        //用于兼容早期Group信息在zk上面维护的版本。
         val responseInfo = authorizedTopicRequestInfo.map {
           case (topicPartition, partitionData) =>
             val topicDirs = new ZKGroupTopicDirs(offsetCommitRequest.groupId, topicPartition.topic)
@@ -314,9 +317,10 @@ class KafkaApis(val requestChannel: RequestChannel,
         sendResponseCallback(responseInfo)
       } else {
         // for version 1 and beyond store offsets in offset manager
-
+        //新版本的消费组信息，在此过程中处理
         // compute the retention time based on the request version:
         // if it is v1 or not specified by user, we can use the default retention
+        //计算group的超时时间，1.0.1的kafka版本中并不支持用户自己定义超时时间，而使用默认时间1天。
         val offsetRetention =
           if (header.apiVersion <= 1 ||
             offsetCommitRequest.retentionTime == OffsetCommitRequest.DEFAULT_RETENTION_TIME)
@@ -330,6 +334,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         //   - If v1 and no explicit commit timestamp is provided we use default expiration timestamp.
         //   - If v1 and explicit commit timestamp is provided we calculate retention from that explicit commit timestamp
         //   - If v2 we use the default expiration timestamp
+        //计算offset的超时时间和提交时间
         val currentTimestamp = time.milliseconds
         val defaultExpireTimestamp = offsetRetention + currentTimestamp
         val partitionData = authorizedTopicRequestInfo.mapValues { partitionData =>
@@ -345,7 +350,7 @@ class KafkaApis(val requestChannel: RequestChannel,
             }
           )
         }
-
+        // 提交偏移量
         // call coordinator to handle commit offset
         groupCoordinator.handleCommitOffsets(
           offsetCommitRequest.groupId,

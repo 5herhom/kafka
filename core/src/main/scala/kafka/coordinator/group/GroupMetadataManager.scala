@@ -85,7 +85,9 @@ class GroupMetadataManager(brokerId: Int,
   newGauge("NumOffsets",
     new Gauge[Int] {
       def value = groupMetadataCache.values.map(group => {
-        group.inLock { group.numOffsets }
+        group.inLock {
+          group.numOffsets
+        }
       }).sum
     }
   )
@@ -107,9 +109,13 @@ class GroupMetadataManager(brokerId: Int,
 
   def currentGroups: Iterable[GroupMetadata] = groupMetadataCache.values
 
-  def isPartitionOwned(partition: Int) = inLock(partitionLock) { ownedPartitions.contains(partition) }
+  def isPartitionOwned(partition: Int) = inLock(partitionLock) {
+    ownedPartitions.contains(partition)
+  }
 
-  def isPartitionLoading(partition: Int) = inLock(partitionLock) { loadingPartitions.contains(partition) }
+  def isPartitionLoading(partition: Int) = inLock(partitionLock) {
+    loadingPartitions.contains(partition)
+  }
 
   def partitionFor(groupId: String): Int = Utils.abs(groupId.hashCode) % groupMetadataTopicPartitionCount
 
@@ -117,7 +123,9 @@ class GroupMetadataManager(brokerId: Int,
 
   def isGroupLoading(groupId: String): Boolean = isPartitionLoading(partitionFor(groupId))
 
-  def isLoading(): Boolean = inLock(partitionLock) { loadingPartitions.nonEmpty }
+  def isLoading(): Boolean = inLock(partitionLock) {
+    loadingPartitions.nonEmpty
+  }
 
   // visible for testing
   private[group] def isGroupOpenForProducer(producerId: Long, groupId: String) = openGroupsForProducer.get(producerId) match {
@@ -126,6 +134,7 @@ class GroupMetadataManager(brokerId: Int,
     case None =>
       false
   }
+
   /**
    * Get the group associated with the given groupId, or null if not found
    */
@@ -224,6 +233,7 @@ class GroupMetadataManager(brokerId: Int,
 
           responseCallback(responseError)
         }
+
         appendForGroup(group, groupMetadataRecords, putCacheCallback)
 
       case None =>
@@ -275,32 +285,44 @@ class GroupMetadataManager(brokerId: Int,
       responseCallback(commitStatus)
       None
     } else {
+      // 检查消息groupid对应提交的消息是否属于这个broker
+      // 如果不是，则返回None。
+      // 如果是，则返回消息格式的版本和时间戳
       getMagic(partitionFor(group.groupId)) match {
         case Some(magicValue) =>
           // We always use CREATE_TIME, like the producer. The conversion to LOG_APPEND_TIME (if necessary) happens automatically.
+          // CreateTime : 表示producer创建这条消息的时间
+          // LogAppendTime ： 表示broker写入磁盘的时间
           val timestampType = TimestampType.CREATE_TIME
           val timestamp = time.milliseconds()
-
+          // 生成log-record的key和value
           val records = filteredOffsetMetadata.map { case (topicPartition, offsetAndMetadata) =>
+            // Key：groupId | topicName | partitionNo
             val key = GroupMetadataManager.offsetCommitKey(group.groupId, topicPartition)
+            // value: offset | metadata | commitTimestamp | expireTimestamp
             val value = GroupMetadataManager.offsetCommitValue(offsetAndMetadata)
+            // log-record对象
             new SimpleRecord(timestamp, key, value)
           }
+          // 指定topic：__consumer_offsets和根据groupId的哈希值%__consumer_offsets的partition数生成的partitionNo。
           val offsetTopicPartition = new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, partitionFor(group.groupId))
+          // 预创建堆内存
           val buffer = ByteBuffer.allocate(AbstractRecords.estimateSizeInBytes(magicValue, compressionType, records.asJava))
 
           if (isTxnOffsetCommit && magicValue < RecordBatch.MAGIC_VALUE_V2)
             throw Errors.UNSUPPORTED_FOR_MESSAGE_FORMAT.exception("Attempting to make a transaction offset commit with an invalid magic: " + magicValue)
-
+          // 绑定buffer和record创建器
           val builder = MemoryRecords.builder(buffer, magicValue, compressionType, timestampType, 0L, time.milliseconds(),
             producerId, producerEpoch, 0, isTxnOffsetCommit, RecordBatch.NO_PARTITION_LEADER_EPOCH)
-
+          // 将records批量序列化为byte写入buffer中
           records.foreach(builder.append)
           val entries = Map(offsetTopicPartition -> builder.build())
 
           // set the callback function to insert offsets into cache after log append completed
+          // record落盘成功以后，更新缓存中的offset的回调函数
           def putCacheCallback(responseStatus: Map[TopicPartition, PartitionResponse]) {
             // the append response should only contain the topics partition
+            // 同一个groupid只能提交到一个partition
             if (responseStatus.size != 1 || !responseStatus.contains(offsetTopicPartition))
               throw new IllegalStateException("Append status %s should only have one partition %s"
                 .format(responseStatus, offsetTopicPartition))
@@ -316,6 +338,7 @@ class GroupMetadataManager(brokerId: Int,
                     if (isTxnOffsetCommit)
                       group.onTxnOffsetCommitAppend(producerId, topicPartition, CommitRecordMetadataAndOffset(Some(status.baseOffset), offsetAndMetadata))
                     else
+                    // 在缓存中更新offset信息
                       group.onOffsetCommitAppend(topicPartition, CommitRecordMetadataAndOffset(Some(status.baseOffset), offsetAndMetadata))
                   }
                 }
@@ -328,6 +351,7 @@ class GroupMetadataManager(brokerId: Int,
                     if (isTxnOffsetCommit)
                       group.failPendingTxnOffsetCommit(producerId, topicPartition)
                     else
+                    //失败后移除bending中的offset
                       group.failPendingOffsetWrite(topicPartition, offsetAndMetadata)
                   }
                 }
@@ -374,11 +398,14 @@ class GroupMetadataManager(brokerId: Int,
               group.prepareTxnOffsetCommit(producerId, offsetMetadata)
             }
           } else {
+            // 将即将提交的offset放进GroupMetadata的pendingOffsetCommits中。
+            // 这里可能是为了拓展，因为上层函数本身就加了锁，根本不需要做二次提交。
             group.inLock {
               group.prepareOffsetCommit(offsetMetadata)
             }
           }
-
+          // 将record落盘，其实只是对通用的落盘方法replicaManager#appendRecords()做了一层封装，固定了一些诸如internalTopicsAllowed和isFromClient的参数
+          // END：offset的提交到此结束，以后是kafka的消息落盘的流程，也是需要单开一篇文章讲的内容了
           appendForGroup(group, entries, putCacheCallback)
 
         case None =>
@@ -397,6 +424,7 @@ class GroupMetadataManager(brokerId: Int,
    */
   def getOffsets(groupId: String, topicPartitionsOpt: Option[Seq[TopicPartition]]): Map[TopicPartition, OffsetFetchResponse.PartitionData] = {
     trace("Getting offsets of %s for group %s.".format(topicPartitionsOpt.getOrElse("all partitions"), groupId))
+    // 依旧从缓存里面拿
     val group = groupMetadataCache.get(groupId)
     if (group == null) {
       topicPartitionsOpt.getOrElse(Seq.empty[TopicPartition]).map { topicPartition =>
@@ -419,6 +447,7 @@ class GroupMetadataManager(brokerId: Int,
 
             case Some(topicPartitions) =>
               topicPartitionsOpt.getOrElse(Seq.empty[TopicPartition]).map { topicPartition =>
+                // 调用内部的offset拿到topic-partition
                 val partitionData = group.offset(topicPartition) match {
                   case None =>
                     new OffsetFetchResponse.PartitionData(OffsetFetchResponse.INVALID_OFFSET, "", Errors.NONE)
@@ -563,7 +592,7 @@ class GroupMetadataManager(brokerId: Int,
           producerOffsets.keySet.map(_.group).foreach(addProducerGroup(producerId, _))
           producerOffsets
             .groupBy(_._1.group)
-            .mapValues(_.map { case (groupTopicPartition, offset) => (groupTopicPartition.topicPartition, offset)})
+            .mapValues(_.map { case (groupTopicPartition, offset) => (groupTopicPartition.topicPartition, offset) })
             .foreach { case (group, offsets) =>
               val groupPendingOffsets = pendingOffsetsByGroup.getOrElseUpdate(group, mutable.Map.empty[Long, mutable.Map[TopicPartition, CommitRecordMetadataAndOffset]])
               val groupProducerOffsets = groupPendingOffsets.getOrElseUpdate(producerId, mutable.Map.empty[TopicPartition, CommitRecordMetadataAndOffset])
@@ -572,7 +601,7 @@ class GroupMetadataManager(brokerId: Int,
         }
 
         val (pendingGroupOffsets, pendingEmptyGroupOffsets) = pendingOffsetsByGroup
-          .partition { case (group, _) => loadedGroups.contains(group)}
+          .partition { case (group, _) => loadedGroups.contains(group) }
 
         loadedGroups.values.foreach { group =>
           val offsets = groupOffsets.getOrElse(group.groupId, Map.empty[TopicPartition, CommitRecordMetadataAndOffset])
@@ -614,9 +643,9 @@ class GroupMetadataManager(brokerId: Int,
       // set the expiration time stamp as commit time stamp + server default retention time
       val updatedOffsetAndMetadata =
         if (offsetAndMetadata.expireTimestamp == org.apache.kafka.common.requests.OffsetCommitRequest.DEFAULT_TIMESTAMP)
-        offsetAndMetadata.copy(expireTimestamp = offsetAndMetadata.commitTimestamp + config.offsetsRetentionMs)
-      else
-        offsetAndMetadata
+          offsetAndMetadata.copy(expireTimestamp = offsetAndMetadata.commitTimestamp + config.offsetsRetentionMs)
+        else
+          offsetAndMetadata
       CommitRecordMetadataAndOffset(commitRecordOffset, updatedOffsetAndMetadata)
     }
     trace(s"Initialized offsets $loadedOffsets for group ${group.groupId}")
@@ -752,7 +781,7 @@ class GroupMetadataManager(brokerId: Int,
             group.completePendingTxnOffsetCommit(producerId, isCommit)
             removeProducerGroup(producerId, groupId)
           }
-       }
+        }
         case _ =>
           info(s"Group $groupId has moved away from $brokerId after transaction marker was written but before the " +
             s"cache was updated. The cache on the new group owner will be updated instead.")
@@ -785,7 +814,7 @@ class GroupMetadataManager(brokerId: Int,
   /*
    * Check if the offset metadata length is valid
    */
-  private def validateOffsetMetadataLength(metadata: String) : Boolean = {
+  private def validateOffsetMetadataLength(metadata: String): Boolean = {
     metadata == null || metadata.length() <= config.maxMetadataSize
   }
 
@@ -809,8 +838,8 @@ class GroupMetadataManager(brokerId: Int,
   /**
    * Check if the replica is local and return the message format version and timestamp
    *
-   * @param   partition  Partition of GroupMetadataTopic
-   * @return  Some(MessageFormatVersion) if replica is local, None otherwise
+   * @param   partition Partition of GroupMetadataTopic
+   * @return Some(MessageFormatVersion) if replica is local, None otherwise
    */
   private def getMagic(partition: Int): Option[Byte] =
     replicaManager.getMagic(new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, partition))
@@ -834,13 +863,13 @@ class GroupMetadataManager(brokerId: Int,
  * version is used to evolve the messages within their data types:
  *
  * key version 0:       group consumption offset
- *    -> value version 0:       [offset, metadata, timestamp]
+ * -> value version 0:       [offset, metadata, timestamp]
  *
  * key version 1:       group consumption offset
- *    -> value version 1:       [offset, metadata, commit_timestamp, expire_timestamp]
+ * -> value version 1:       [offset, metadata, commit_timestamp, expire_timestamp]
  *
  * key version 2:       group metadata
- *     -> value version 0:       [protocol_type, generation, protocol, leader, members]
+ * -> value version 0:       [protocol_type, generation, protocol, leader, members]
  */
 object GroupMetadataManager {
 
@@ -973,7 +1002,7 @@ object GroupMetadataManager {
    * @return key for offset commit message
    */
   private[group] def offsetCommitKey(group: String, topicPartition: TopicPartition,
-                                           versionId: Short = 0): Array[Byte] = {
+                                     versionId: Short = 0): Array[Byte] = {
     val key = new Struct(CURRENT_OFFSET_KEY_SCHEMA)
     key.set(OFFSET_KEY_GROUP_FIELD, group)
     key.set(OFFSET_KEY_TOPIC_FIELD, topicPartition.topic)
@@ -1024,8 +1053,8 @@ object GroupMetadataManager {
    * assuming the generation id, selected protocol, leader and member assignment are all available
    *
    * @param groupMetadata current group metadata
-   * @param assignment the assignment for the rebalancing generation
-   * @param version the version of the value message to use
+   * @param assignment    the assignment for the rebalancing generation
+   * @param version       the version of the value message to use
    * @return payload for offset commit message
    */
   private[group] def groupMetadataValue(groupMetadata: GroupMetadata,
@@ -1231,8 +1260,9 @@ case class GroupTopicPartition(group: String, topicPartition: TopicPartition) {
     "[%s,%s,%d]".format(group, topicPartition.topic, topicPartition.partition)
 }
 
-trait BaseKey{
+trait BaseKey {
   def version: Short
+
   def key: Any
 }
 

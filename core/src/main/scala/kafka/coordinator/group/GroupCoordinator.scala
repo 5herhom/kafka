@@ -419,22 +419,30 @@ class GroupCoordinator(val brokerId: Int,
                           generationId: Int,
                           offsetMetadata: immutable.Map[TopicPartition, OffsetAndMetadata],
                           responseCallback: immutable.Map[TopicPartition, Errors] => Unit) {
+    // 校验groupid是否有效
     validateGroup(groupId) match {
       case Some(error) => responseCallback(offsetMetadata.mapValues(_ => error))
       case None =>
         groupManager.getGroup(groupId) match {
           case None =>
+            //如果缓存中不存在groupid，则创建groupid（新增在这里）。
             if (generationId < 0) {
+              // generationId：用于指定group-member的版本，每当有新的member加入的时候，就会+1。
               // the group is not relying on Kafka for group management, so allow the commit
+              // 在缓存中加入GroupId的信息。
               val group = groupManager.addGroup(new GroupMetadata(groupId, initialState = Empty))
+
+              // 添加groupid后，再进行offset的提交。
               doCommitOffsets(group, memberId, generationId, NO_PRODUCER_ID, NO_PRODUCER_EPOCH,
                 offsetMetadata, responseCallback)
             } else {
+              // generationId >=0：说明这个请求是从已存在的groupid提交上来的，但是缓存中又不存在，则说明groupid因为超时等原因已经被删除了。
               // or this is a request coming from an older generation. either way, reject the commit
               responseCallback(offsetMetadata.mapValues(_ => Errors.ILLEGAL_GENERATION))
             }
 
           case Some(group) =>
+            // groupid存在，直接提交offset
             doCommitOffsets(group, memberId, generationId, NO_PRODUCER_ID, NO_PRODUCER_EPOCH,
               offsetMetadata, responseCallback)
         }
@@ -456,10 +464,12 @@ class GroupCoordinator(val brokerId: Int,
                               producerEpoch: Short,
                               offsetMetadata: immutable.Map[TopicPartition, OffsetAndMetadata],
                               responseCallback: immutable.Map[TopicPartition, Errors] => Unit) {
+    // 因为上文的所有GroupMetadata都是从GroupMetadataManager的缓存中获取的，所以这里对GroupMetadata就加锁都是同一个对象
     group.inLock {
       if (group.is(Dead)) {
         responseCallback(offsetMetadata.mapValues(_ => Errors.UNKNOWN_MEMBER_ID))
       } else if ((generationId < 0 && group.is(Empty)) || (producerId != NO_PRODUCER_ID)) {
+        // 新增groupid或者使用了事务的操作在这里
         // The group is only using Kafka to store offsets.
         // Also, for transactional offset commits we don't need to validate group membership and the generation.
         groupManager.storeOffsets(group, memberId, offsetMetadata, responseCallback, producerId, producerEpoch)
@@ -468,9 +478,13 @@ class GroupCoordinator(val brokerId: Int,
       } else if (!group.has(memberId)) {
         responseCallback(offsetMetadata.mapValues(_ => Errors.UNKNOWN_MEMBER_ID))
       } else if (generationId != group.generationId) {
+        // 提交的generationId和当前broker上的generationId不同，说明已经有新的member加入，并且已经重平衡，需要重新平衡以后再提交
         responseCallback(offsetMetadata.mapValues(_ => Errors.ILLEGAL_GENERATION))
       } else {
+        // groupid已存在的情况下提交，
         val member = group.get(memberId)
+        // 和新增groupid的区别
+        // 将member对应的心跳时间设置为当前操作的时间，并将已有的心跳检测器置为完成并移除，重新设置延迟心跳检测的调度。
         completeAndScheduleNextHeartbeatExpiration(group, member)
         groupManager.storeOffsets(group, memberId, offsetMetadata, responseCallback)
       }
@@ -504,12 +518,16 @@ class GroupCoordinator(val brokerId: Int,
 
   def handleDescribeGroup(groupId: String): (Errors, GroupSummary) = {
     if (!isActive.get) {
+      //当前broker是否启动
       (Errors.COORDINATOR_NOT_AVAILABLE, GroupCoordinator.EmptyGroup)
     } else if (!isCoordinatorForGroup(groupId)) {
+      //当前broker是否是消费组应该分配的Coordinator
       (Errors.NOT_COORDINATOR, GroupCoordinator.EmptyGroup)
     } else if (isCoordinatorLoadInProgress(groupId)) {
+      //当消费的topic存在partition的易主操作，就会触发group信息的重新加载，处于重加载状态中时，则触发当前情况
       (Errors.COORDINATOR_LOAD_IN_PROGRESS, GroupCoordinator.EmptyGroup)
     } else {
+      //核心
       groupManager.getGroup(groupId) match {
         case None => (Errors.NONE, GroupCoordinator.DeadGroup)
         case Some(group) =>
