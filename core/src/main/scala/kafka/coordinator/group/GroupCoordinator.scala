@@ -269,24 +269,30 @@ class GroupCoordinator(val brokerId: Int,
           case AwaitingSync =>
             group.get(memberId).awaitingSyncCallback = responseCallback
 
+            //判断请求的成员是否是消费组的leader
             // if this is the leader, then we can attempt to persist state and transition to stable
             if (group.isLeader(memberId)) {
               info(s"Assignment received from leader for group ${group.groupId} for generation ${group.generationId}")
 
+              // 将未分配到分区的member对应的分配结果填充为空的byte数组
               // fill any missing members with an empty assignment
               val missing = group.allMembers -- groupAssignment.keySet
               val assignment = groupAssignment ++ missing.map(_ -> Array.empty[Byte]).toMap
 
               groupManager.storeGroup(group, assignment, (error: Errors) => {
                 group.inLock {
+                  // 分配结果落盘以后的回调函数
                   // another member may have joined the group while we were awaiting this callback,
                   // so we must ensure we are still in the AwaitingSync state and the same generation
                   // when it gets invoked. if we have transitioned to another state, then do nothing
                   if (group.is(AwaitingSync) && generationId == group.generationId) {
                     if (error != Errors.NONE) {
                       resetAndPropagateAssignmentError(group, error)
+                      // 切换成PrepareRebalance，重新平衡
                       maybePrepareRebalance(group)
                     } else {
+                      // 分配结果落盘成功，将消费组状态设置为Stable
+                      // 并唤醒其他成员的等待
                       setAndPropagateAssignment(group, assignment)
                       group.transitionTo(Stable)
                     }
@@ -296,6 +302,7 @@ class GroupCoordinator(val brokerId: Int,
             }
 
           case Stable =>
+            //如果分配完成则返回分配结果，并刷新心跳检测时间
             // if the group is stable, we just return the current assignment
             val memberMetadata = group.get(memberId)
             responseCallback(memberMetadata.assignment, Errors.NONE)
