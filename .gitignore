@@ -10,7 +10,7 @@ src_managed/
 project/boot/
 project/plugins/project/
 patch-process/*
-.idea
+.idea/*
 !.idea/workspace.xml
 .svn
 .classpath
